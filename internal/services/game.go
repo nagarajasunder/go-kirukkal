@@ -15,7 +15,7 @@ import (
 var GameWords = [...]string{"Pen", "Paper", "Refrigerator", "Television", "Laptop"}
 
 type IGameService interface {
-	CreateRoom() (dtos.RoomCreationSuccess, error)
+	CreateRoom(roomName string) (dtos.RoomCreationSuccess, error)
 	CreateNewPlayer(roomId string, playerName string, isAdmin bool, conn *websocket.Conn)
 	DoesRoomExists(roomId string) bool
 }
@@ -32,13 +32,20 @@ type GameService struct {
 	rooms map[string]*dtos.Room
 }
 
-func (r *GameService) CreateRoom() (dtos.RoomCreationSuccess, error) {
+func (r *GameService) CreateRoom(roomName string) (dtos.RoomCreationSuccess, error) {
 	var roomId string = uuid.New().String()
-	r.addNewRoom(roomId)
+	r.addNewRoom(roomId, roomName)
 
 	resp := dtos.RoomCreationSuccess{
-		RoomId: roomId,
+		RoomId:   roomId,
+		RoomName: roomName,
 	}
+
+	message := dtos.RoomCreationMessage{
+		RoomId:   roomId,
+		RoomName: roomId,
+	}
+	SendRoomCreationUpdates(message)
 
 	return resp, nil
 }
@@ -49,12 +56,14 @@ func (r *GameService) DoesRoomExists(roomId string) bool {
 	return exists
 }
 
-func (r *GameService) addNewRoom(roomId string) {
+func (r *GameService) addNewRoom(roomId string, roomName string) {
 
 	players := []*dtos.Player{}
 	newRoom := &dtos.Room{
 		RoomId:     roomId,
+		RoomName:   roomName,
 		Players:    players,
+		GameStatus: globals.GAME_STATUS_IDLE,
 		DrawnUsers: map[string]bool{},
 	}
 	r.rooms[roomId] = newRoom
@@ -82,22 +91,200 @@ func (r *GameService) CreateNewPlayer(roomId string, playerName string, isAdmin 
 	room.Players = players
 	r.rooms[roomId] = room
 
-	playerInfo := dtos.PlayCreationSuccess{
-		PlayerId: playerId,
+	playerCreationMessage := dtos.PlayCreationSuccess{
+		PlayerId:   playerId,
+		PlayerName: playerName,
 	}
 
-	playerCreationMessage, err := json.Marshal(playerInfo)
-
-	if err != nil {
-		log.Printf("Unable to send message to player %s err: %#v", playerId, err)
-		playerConn.Close()
-		return
-	}
-
-	playerConn.WriteMessage(websocket.TextMessage, playerCreationMessage)
+	r.SendMessageToPlayer(&newPlayer, globals.MESSAGE_TYPE_PLAYER_CREATED, playerCreationMessage)
 	fmt.Printf("New player created %s \n", playerName)
 
 	go r.readPlayerMessages(roomId, &newPlayer)
+
+	r.NewPlayerJoined(roomId, &newPlayer)
+
+}
+
+func (r *GameService) removePlayer(roomId string, playerId string) {
+	room := r.rooms[roomId]
+	var updatedPlayers []*dtos.Player
+
+	for _, player := range room.Players {
+		if player.PlayerId != playerId {
+			updatedPlayers = append(updatedPlayers, player)
+		}
+	}
+
+	room.Players = updatedPlayers
+
+	r.rooms[roomId] = room
+}
+
+func (r *GameService) NewPlayerJoined(roomId string, newPlayer *dtos.Player) {
+
+	/*
+		When a new player joins the game
+		1. Welcome him
+		2. Notify other users to that he had joined
+	*/
+
+	room := r.rooms[roomId]
+
+	for _, player := range room.Players {
+		if player.PlayerId == newPlayer.PlayerId {
+			chatMessage := dtos.Chat{
+				Sender:  globals.MESSAGE_SENDER_ADMIN,
+				Message: fmt.Sprintf("Welcome to the party %s!!", newPlayer.PlayerName),
+			}
+			r.SendMessageToPlayer(player, globals.MESSAGE_TYPE_CHAT, chatMessage)
+		} else {
+			chatMessage := dtos.Chat{
+				Sender:  globals.MESSAGE_SENDER_ADMIN,
+				Message: fmt.Sprintf("%s joined the party!!", newPlayer.PlayerName),
+			}
+			r.SendMessageToPlayer(player, globals.MESSAGE_TYPE_CHAT, chatMessage)
+		}
+	}
+}
+
+func (r *GameService) StartGame(roomId string) {
+	room := r.rooms[roomId]
+	drawingPlayer := r.GetPlayerToChooseWord(roomId)
+	room.DrawingUser = drawingPlayer
+	room.DrawnUsers[drawingPlayer.PlayerId] = true
+	room.GameStatus = globals.GAME_STATUS_STARTED
+
+	for _, player := range room.Players {
+		r.SendMessageToPlayer(player, globals.MESSAGE_TYPE_GAME_STATUS, globals.GAME_STATUS_STARTED)
+	}
+
+	currentRoundWords := getRandomWordsToChoose()
+
+	gameWordsMessage := dtos.GameWords{
+		Words: currentRoundWords,
+	}
+
+	r.SendMessageToPlayer(drawingPlayer, globals.MESSAGE_TYPE_PLAYER_WORD_OPTIONS, gameWordsMessage)
+
+	r.SendMessageToPlayer(drawingPlayer, globals.MESSAGE_TYPE_UPDATE_DRAWING_PLAYER, drawingPlayer.PlayerId)
+
+	for _, player := range room.Players {
+		if player.PlayerId != drawingPlayer.PlayerId {
+			r.SendMessageToPlayer(player, globals.MESSAGE_TYPE_GAME_MESSAGE, fmt.Sprintf("%s is choosing the word...", drawingPlayer.PlayerName))
+		}
+	}
+}
+
+func (r *GameService) SendGameWordsToUsers(roomId string, messageByte json.RawMessage) {
+	room := r.rooms[roomId]
+
+	var gameWord string
+
+	err := json.Unmarshal(messageByte, &gameWord)
+
+	if err != nil {
+		fmt.Printf("Unable to parse message err %#v", err)
+		return
+	}
+
+	r.SendMessageToPlayer(room.DrawingUser, globals.MESSAGE_TYPE_GAME_MESSAGE, gameWord)
+
+	room.CurrentRoundWord = &gameWord
+
+	gameWordClue := ""
+
+	for i := 0; i < len(gameWord); i++ {
+		gameWordClue += " _ "
+	}
+
+	for _, player := range room.Players {
+		if player.PlayerId != room.DrawingUser.PlayerId {
+			r.SendMessageToPlayer(player, globals.MESSAGE_TYPE_GAME_MESSAGE, gameWordClue)
+		}
+	}
+
+}
+
+func (r *GameService) ProcessPlayerChats(roomId string, player *dtos.Player, rawMessage json.RawMessage) {
+	room := r.rooms[roomId]
+
+	var playerChat dtos.Chat
+
+	err := json.Unmarshal(rawMessage, &playerChat)
+
+	if err != nil {
+		fmt.Printf("Unable to process message sent by %s err %#v", player.PlayerName, err)
+		return
+	}
+
+	for _, p := range room.Players {
+		r.SendMessageToPlayer(p, globals.MESSAGE_TYPE_CHAT, playerChat)
+	}
+
+}
+
+func (r *GameService) CheckIfGameWordMatch(roomId string, player *dtos.Player, messageByte json.RawMessage) {
+	room := r.rooms[roomId]
+
+	var playerChat dtos.Chat
+
+	err := json.Unmarshal(messageByte, &playerChat)
+
+	if err != nil {
+		fmt.Printf("Unable to process message sent by %s err %#v", player.PlayerName, err)
+		return
+	}
+
+	if playerChat.Message == *room.CurrentRoundWord {
+		for _, p := range room.Players {
+			if p.PlayerId != player.PlayerId {
+				chat := dtos.Chat{
+					Sender:  globals.MESSAGE_SENDER_ADMIN,
+					Message: fmt.Sprintf("Player %s guessed to word", player.PlayerName),
+				}
+				r.SendMessageToPlayer(p, globals.MESSAGE_SENDER_ADMIN, chat)
+			} else {
+				r.SendMessageToPlayer(p, globals.MESSAGE_TYPE_CHAT, playerChat)
+			}
+		}
+	} else {
+		for _, p := range room.Players {
+			r.SendMessageToPlayer(p, globals.MESSAGE_TYPE_CHAT, playerChat)
+		}
+	}
+}
+
+func (r *GameService) GetPlayerToChooseWord(roomId string) *dtos.Player {
+	room := r.rooms[roomId]
+	for _, player := range room.Players {
+		alreadyChosed := room.DrawnUsers[player.PlayerId]
+		if !alreadyChosed {
+			return player
+		}
+	}
+	return nil
+}
+
+func (r *GameService) ProcessDrawMessage(roomId string, messageByte json.RawMessage) {
+
+	room := r.rooms[roomId]
+
+	var line dtos.Line
+
+	err := json.Unmarshal(messageByte, &line)
+
+	if err != nil {
+		fmt.Printf("Unable to parse draw message err %#v", err)
+		return
+	}
+
+	//Stream draw messages to other players
+	for _, player := range room.Players {
+		if player.PlayerId != room.DrawingUser.PlayerId {
+			r.SendMessageToPlayer(player, globals.MESSAGE_TYPE_STREAM_DRAW, messageByte)
+		}
+	}
+
 }
 
 func (r *GameService) readPlayerMessages(roomId string, player *dtos.Player) {
@@ -128,161 +315,40 @@ func (r *GameService) readPlayerMessages(roomId string, player *dtos.Player) {
 		case globals.MESSAGE_TYPE_START_GAME:
 			r.StartGame(roomId)
 		case globals.MESSAGE_TYPE_PLAYER_CHOOSED_WORD:
-			r.SendGameWordsToOtherUsers(roomId, messagePaylod.Message)
+			r.SendGameWordsToUsers(roomId, messagePaylod.Message)
 		case globals.MESSAGE_TYPE_CHAT:
+			r.ProcessPlayerChats(roomId, player, messagePaylod.Message)
+		case globals.MESSAGE_TYPE_DRAW:
+			r.ProcessDrawMessage(roomId, messagePaylod.Message)
+		case globals.MESSAGE_TYPE_GAME_CHAT:
 			r.CheckIfGameWordMatch(roomId, player, messagePaylod.Message)
-
 		}
 
 	}
 }
 
-func (r *GameService) removePlayer(roomId string, playerId string) {
-	room := r.rooms[roomId]
-	var updatedPlayers []*dtos.Player
-
-	for _, player := range room.Players {
-		if player.PlayerId != playerId {
-			updatedPlayers = append(updatedPlayers, player)
-		}
-	}
-
-	room.Players = updatedPlayers
-
-	r.rooms[roomId] = room
-}
-
-func (r *GameService) StartGame(roomId string) {
-	room := r.rooms[roomId]
-	drawingPlayer := r.GetPlayerToChooseWord(roomId)
-	room.DrawingUser = drawingPlayer
-	room.DrawnUsers[drawingPlayer.PlayerId] = true
-
-	currentRoundWords := getRandomWordsToChoose()
-
-	wsMessage := dtos.GameMessage{
-		MessageType: globals.MESSAGE_TYPE_PLAYER_WORD_OPTIONS,
-		Message:     currentRoundWords,
-	}
-
-	r.SendMessageToPlayer(drawingPlayer, wsMessage)
-
-	for _, player := range room.Players {
-		if player.PlayerId != drawingPlayer.PlayerId {
-			wsMessage := dtos.GameMessage{
-				MessageType: globals.MESSAGE_TYPE_PLAYER_CHOOSING_WORD,
-				Message:     fmt.Sprintf("%s is choosing the word", drawingPlayer.PlayerName),
-			}
-			r.SendMessageToPlayer(player, wsMessage)
-		}
-	}
-}
-
-func (r *GameService) SendGameWordsToOtherUsers(roomId string, message interface{}) {
-	room := r.rooms[roomId]
-
-	gameWord := message.(string)
-
-	room.CurrentRoundWord = &gameWord
-
-	for _, player := range room.Players {
-		if player.PlayerId != room.DrawingUser.PlayerId {
-			wsMessage := dtos.GameMessage{
-				MessageType: globals.MESSAGE_TYPE_GAME_WORD_CLUE,
-				Message:     len(gameWord),
-			}
-			r.SendMessageToPlayer(player, wsMessage)
-		}
-	}
-
-}
-
-func (r *GameService) CheckIfGameWordMatch(roomId string, player *dtos.Player, message interface{}) {
-	room := r.rooms[roomId]
-
-	playerGuessedWord := message.(string)
-
-	if playerGuessedWord == *room.CurrentRoundWord {
-		for _, p := range room.Players {
-			if p.PlayerId != player.PlayerId {
-				chat := dtos.Chat{
-					Sender:  globals.MESSAGE_SENDER_ADMIN,
-					Message: fmt.Sprintf("Player %s guessed to word", player.PlayerName),
-				}
-				wsMessage := dtos.GameMessage{
-					MessageType: globals.MESSAGE_TYPE_CHAT,
-					Message:     chat,
-				}
-				r.SendMessageToPlayer(p, wsMessage)
-			} else {
-				chat := dtos.Chat{
-					Sender:  player.PlayerName,
-					Message: playerGuessedWord,
-				}
-				wsMessage := dtos.GameMessage{
-					MessageType: globals.MESSAGE_TYPE_CHAT,
-					Message:     chat,
-				}
-				r.SendMessageToPlayer(p, wsMessage)
-			}
-		}
-	} else {
-		for _, p := range room.Players {
-			chat := dtos.Chat{
-				Sender:  player.PlayerName,
-				Message: playerGuessedWord,
-			}
-			wsMessage := dtos.GameMessage{
-				MessageType: globals.MESSAGE_TYPE_CHAT,
-				Message:     chat,
-			}
-			r.SendMessageToPlayer(p, wsMessage)
-		}
-	}
-}
-
-func (r *GameService) GetPlayerToChooseWord(roomId string) *dtos.Player {
-	room := r.rooms[roomId]
-	for _, player := range room.Players {
-		alreadyChosed := room.DrawnUsers[player.PlayerId]
-		if !alreadyChosed {
-			return player
-		}
-	}
-	return nil
-}
-
-func (r *GameService) ProcessDrawMessage(roomId string, playerId string, messageType int, message []byte) {
-
-	room := r.rooms[roomId]
-
-	//Filter other players
-	var otherPlayers []*dtos.Player
-
-	for _, player := range room.Players {
-		if player.PlayerId != playerId {
-			otherPlayers = append(otherPlayers, player)
-		}
-	}
-
-	//Broadcast messages
-
-	for _, player := range otherPlayers {
-		player.PlayerConn.WriteMessage(messageType, message)
-	}
-
-}
-
-func (r *GameService) SendMessageToPlayer(player *dtos.Player, message dtos.GameMessage) {
+func (r *GameService) SendMessageToPlayer(player *dtos.Player, messageType string, message interface{}) {
 
 	messageByte, err := json.Marshal(message)
 
 	if err != nil {
-		log.Printf("Unable to marshal message payload %#v %#v", message, err)
+		fmt.Printf("Unable to marshal message %#v error %#v", message, err)
 		return
 	}
 
-	err = player.PlayerConn.WriteMessage(websocket.TextMessage, messageByte)
+	wsMessage := dtos.GameMessage{
+		MessageType: messageType,
+		Message:     messageByte,
+	}
+
+	wsMessageByte, err := json.Marshal(wsMessage)
+
+	if err != nil {
+		log.Printf("Unable to marshal message payload %#v %#v", wsMessage, err)
+		return
+	}
+
+	err = player.PlayerConn.WriteMessage(websocket.TextMessage, wsMessageByte)
 
 	if err != nil {
 		log.Printf("Unable to send message to player %s err: %#v", player.PlayerId, err)

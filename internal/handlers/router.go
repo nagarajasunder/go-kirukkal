@@ -10,7 +10,8 @@ func New() http.Handler {
 
 	router := httprouter.New()
 	setPingRoutes(router)
-	setRoomRoutes(router)
+	setGameRoutes(router)
+	SetRoomRoutes(router)
 
 	return router
 }

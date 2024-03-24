@@ -1,8 +1,10 @@
 package dtos
 
+import "encoding/json"
+
 type GameMessage struct {
-	MessageType string      `json:"message_type"`
-	Message     interface{} `json:"message"`
+	MessageType string          `json:"message_type"`
+	Message     json.RawMessage `json:"message"`
 }
 
 type Line struct {
@@ -17,7 +19,11 @@ type ChooseGameWordsMessage struct {
 }
 
 type Chat struct {
-	Message string `json:"message"`
-	Sender  string `json:"sender"`
-	Time    string `json:"time"`
+	Message    string `json:"message"`
+	Sender     string `json:"sender"`
+	TimeMillis int64  `json:"time"`
+}
+
+type GameWords struct {
+	Words []string `json:"words"`
 }
